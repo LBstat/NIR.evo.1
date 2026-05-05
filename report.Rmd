@@ -1,0 +1,561 @@
+---
+title: "Non-Destructive Freshness Assessment in Fish Fillets via NIR Spectroscopy: Multivariate Optimization and K-value Classification Strategies"
+author: "Luca Bernardi"
+date: "2026-01-10"
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 12,
+  fig.height = 6,
+  echo = FALSE
+)
+```
+
+## **Introduction**
+
+### Study Objectives
+
+Researchers from the Faculty of Veterinary Medicine at the University of Milan conducted a preliminary study to evaluate the applicability of Near-Infrared (NIR) spectroscopy for the identification and classification of fresh gilthead seabream (Sparus aurata) fillets. NIR spectroscopy is a rapid, non-destructive analytical technique that exploits the interaction between near-infrared radiation and molecular bonds within the sample: absorbed energy excites characteristic vibrational modes, producing a spectrum that reflects the chemical and physical composition of the material — a spectral "fingerprint" amenable to multivariate analysis.
+
+Building on previous exploratory investigations, this study pursued two objectives:
+
+1. To investigate the relationship between NIR spectral information and the K-value, a widely used biochemical freshness index defined as:
+
+$$
+K(\%) = \frac{[Inosine] + [Hypoxanthine]}{[ATP] + [ADP] + [AMP] + [IMP] + [Inosine] + [Hypoxanthine]} \times 100
+$$
+The K-value reflects the progressive degradation of adenosine triphosphate (ATP) following post-mortem muscle biochemistry, and is a recognised standard for freshness assessment in fish.
+
+2. To evaluate the discriminative ability of NIR spectroscopy for classifying fillets as marketable or non-marketable, with particular attention to model robustness under different classification thresholds and missing data scenarios.
+
+### Study Design and Dataset
+
+Data were collected between May and June 2025 on 49 gilthead seabream (Sparus aurata) fillets stored under controlled conditions for up to 10 days. NIR spectra were acquired at five distinct positions per fillet to account for spatial variability and subsequently averaged. The dataset includes the following variables:
+
+| Variable | Description |
+|---|---|
+| Sample | Fillet identifier |
+| Day | Storage day (1–10) |
+| L* | CIE lightness |
+| a* | Redness index |
+| b* | Yellowness index |
+| C* | Chroma (derived from a* and b*) |
+| h | Hue angle |
+| mg N/100g | Volatile basic nitrogen concentration |
+| K-value | Biochemical freshness index |
+| NIR wavelengths | Spectral absorbance at 140 wavelengths (1350–2556 nm) |
+| IMP, ATP, ADP, AMP, Inosine, Hypoxanthine | Chemical components for K-value computation (partially missing) |
+
+## **Data Analysis**
+
+### 1.1 Data Preparation and Pre-Processing
+
+```{r data import}
+source("settings.R")
+source("source_all.R")
+
+if (!file.exists("data/intermediate/data analysis.rds")) {
+  build_data_main()
+}
+
+data_original <- readRDS("data/intermediate/data analysis.rds")
+
+kableExtra::kable(data_original[,1:20], "html", caption = "Table 1: Original dataset") |>
+  kableExtra::kable_styling(full_width = FALSE, font_size = 10) |>
+  kableExtra::scroll_box(width = "100%", height = "400px")
+```
+
+Raw NIR spectra, acquired at five positions per fillet, were averaged to obtain a single representative spectrum per sample. Spectra were subsequently pre-processed in two sequential steps. First, a Savitzky-Golay filter (window = 11, polynomial degree = 2) was applied to reduce high-frequency noise while preserving spectral shape. Second, Standard Normal Variate (SNV) normalisation was applied per sample to remove multiplicative scatter effects and baseline shifts. Pre-processing was performed at the sample level to preserve inter-sample independence.
+
+### 1.2 Missing Data
+
+To impute missing chemical values, predictor variables were ordered by their mean absolute correlation with the six chemical components and used as predictors in the Predictive Mean Matching (PMM) algorithm. This ordering ensures that the most informative predictors enter the imputation model first, improving convergence and reducing imputation uncertainty. Colour variables (L*, a*, b*, C*, h) and volatile basic nitrogen (mg N/100g) were included as auxiliary predictors alongside storage day, as they capture complementary aspects of post-mortem muscle deterioration. NIR wavelengths were excluded from the imputation model to avoid circularity with the subsequent spectral analysis.
+
+```{r data pre-processing}
+nir_vars <- grep("^[[:digit:]]+$", colnames(data_original), value = TRUE)
+nir_vars_w <- paste0("W", nir_vars)
+
+chem_vars <- c("IMP", "ATP", "ADP", "ipoxantina", "AMP", "Inosina")
+complete_idx <- complete.cases(data_original[, ..chem_vars])
+
+data_spectra_full <- preprocess_nir(data_original[, ..nir_vars])
+data_spectra_real <- data_spectra_full[complete_idx]
+
+# cat(
+#  sprintf("NIR: n_full=%d | n_real=%d | n_bands=%d\n",
+#  nrow(data_spectra_full), nrow(data_spectra_real), ncol(data_spectra_full))
+#  )
+
+lightness_vars <- c("L.median", "a.median", "b.median", "C.median", "h.median")
+all_pred_vars <- c(chem_vars, "mg di N/100g", lightness_vars, "day")
+
+data_cc <- data_original[complete_idx]
+
+cor_order <- sort(sapply(all_pred_vars, function(v) {
+  if (!is.numeric(data_cc[[v]])) return(NA_real_)
+  mean(sapply(chem_vars, function(c) abs(cor(data_cc[[v]], data_cc[[c]], use = "complete.obs"))))
+}), decreasing = TRUE)
+
+pred_vars_ordered <- names(cor_order[!is.na(cor_order)])
+
+kableExtra::kable(round(cor_order[!is.na(cor_order)], 3), "html", caption = "Table 2: Predictors correlation") |>
+  kableExtra::kable_styling(full_width = FALSE, font_size = 10) |>
+  kableExtra::scroll_box(width = "100%", height = "400px")
+
+p1 <- ggplot_spectral_comparison(data_original[, ..nir_vars], data_spectra_full)
+p1
+```
+
+```{r data imputation}
+data_mice <- as.data.frame(data_original[, ..pred_vars_ordered])
+pred_matrix <- make.predictorMatrix(data_mice)
+pred_matrix[setdiff(pred_vars_ordered, chem_vars), ] <- 0
+
+set.seed(123)
+imp <- mice(data_mice, m = N_IMP, maxit = 50, method = "pmm", seed = 123, predictorMatrix = pred_matrix, printFlag = FALSE)
+```
+
+To assess the quality of each imputed dataset, three criteria were evaluated:
+
+(i) the Kolmogorov-Smirnov distance between the K-value distribution of imputed and observed fillets
+
+(ii) the mean squared error of imputed K-values against predictions from a day-linear regression
+
+(iii) the Frobenius norm of the difference between the inter-chemical correlation matrix of the imputed dataset and that of the complete cases
+
+A composite rank across these three criteria was used to identify the primary reference dataset for initial model comparison.
+
+Notwithstanding the algorithmic selection procedure and visual diagnostics, inspection of inter-chemical correlations across imputed datasets revealed that imputation systematically reduces the average correlation between chemical variables compared to the complete-case dataset. This attenuation reflects an inherent limitation of PMM in high-correlation settings: imputed values are drawn from observed donors, introducing additional variability that partially obscures the true covariance structure. This observation suggests that results obtained on imputed data should be interpreted with appropriate caution, and motivates the parallel analysis on complete-case data as a more conservative benchmark.
+
+```{r data evaluation, fig.height = 8}
+missing_rows <- which(!complete_idx)
+complete_rows <- which(complete_idx)
+
+scores <- rbindlist(
+  lapply(1:N_IMP, function(m_idx) {
+    kv <- get_kvalue(imp = imp, m_idx)
+    ks <- ks.test(kv[missing_rows], data_original$Kvalue[complete_rows])
+
+    lm_r <- lm(Kvalue ~ day, data = data_original[complete_rows])
+    pred <- predict(lm_r, newdata = data.frame(day = as.data.table(complete(imp, m_idx))$day[missing_rows]))
+    mse  <- mean((kv[missing_rows] - pred)^2)
+
+    cor_original <- cor(data_original[complete_rows, ..chem_vars], use = "complete.obs")
+    cor_imputed <- cor(as.data.table(complete(imp, m_idx))[, ..chem_vars])
+
+    data.table(
+      dataset = m_idx,
+      ks_D = round(ks$statistic, 4),
+      ks_p = round(ks$p.value, 4),
+      mse = round(mse, 6),
+      cor_diff = round(norm(cor_imputed - cor_original, "F"), 4)
+    )
+  })
+  )
+
+scores[, rank_ks := rank(ks_D)]
+scores[, rank_mse := rank(mse)]
+scores[, rank_cor := rank(cor_diff)]
+scores[, composite_rank := rank_ks + rank_mse + rank_cor]
+
+setorder(scores, composite_rank)
+
+kableExtra::kable(scores, "html", caption = "Table 4: Imputed dataset ranks") |>
+  kableExtra::kable_styling(full_width = FALSE, font_size = 10) |>
+  kableExtra::scroll_box(width = "100%", height = "400px")
+
+BEST_IDX <- scores[1, dataset]
+
+imputed_data <- as.data.table(complete(imp, BEST_IDX))
+imputed_data[, Kvalue := get_kvalue(imp, BEST_IDX)]
+
+p2 <- ggplot_graphical_comparation(imputed_data, imputed_pos = missing_rows, x = "day", "Kvalue", dataset_id = BEST_IDX)
+p2$plot 
+```
+
+```{r classification task}
+kv_best <- get_kvalue(imp, BEST_IDX)
+kv_real <- data_original$Kvalue[complete_idx]
+
+data_IMP <- make_dataset(data_spectra_full[, ..nir_vars_w], kv_best, KVALUE_THRESHOLD, "IMP — best imp., soglia 0.5, n = 49", print = FALSE)
+data_REAL <- make_dataset(data_spectra_real[, ..nir_vars_w], kv_real, 0.4, "REAL — reale, soglia 0.4, n = 30", print = FALSE)
+
+task_IMP <- make_task(data_IMP, "IMP")
+task_REAL <- make_task(data_REAL, "REAL")
+
+set.seed(123)
+ri_IMP <- rsmp("repeated_cv", folds = 5, repeats = 10)
+ri_IMP$instantiate(task_IMP)
+ri_REAL <- rsmp("loo")
+ri_REAL$instantiate(task_REAL)
+```
+
+## **Classification Models**
+
+Let $\{(x_i, y_i)\}_{i=1}^n$ be a training dataset, where $x_i \in \mathbb{R}^p$ denotes the vector of NIR wavelengths and $y_i \in \{0, 1\}$ the corresponding freshness label.
+
+### 2.1 Naïve Bayes (NB)
+
+Naïve Bayes applies Bayes' theorem under the assumption of conditional independence between predictors given the class label:
+
+$$\hat{y}(x) = \arg\max_{c} \; \log \pi_c + \sum_{j=1}^p \log p(x_j \mid y = c)$$
+
+where $\pi_c$ is the prior probability of class $c$ and $p(x_j \mid y = c)$ is the class-conditional density of the $j$-th predictor, estimated via Gaussian kernel smoothing. Despite the strong independence assumption — rarely satisfied in NIR data due to high inter-wavelength correlation — Naïve Bayes often performs competitively in practice, particularly in small-sample settings.
+
+### 2.2 Linear Discriminant Analysis (LDA)
+
+LDA assumes multivariate normality within each class with a shared covariance matrix $\Sigma$:
+
+$$x \mid y = c \sim \mathcal{N}(\mu_c, \Sigma)$$
+
+Classification is based on the linear discriminant score:
+
+$$\delta_c(x) = x^\top \Sigma^{-1} \mu_c - \frac{1}{2} \mu_c^\top \Sigma^{-1} \mu_c + \log \pi_c$$
+
+When $p > n$, $\Sigma$ is singular and LDA is computed via singular value decomposition (SVD), projecting data onto the subspace of maximum class separation. LDA produces linear decision boundaries and is statistically efficient under its assumptions, making it a suitable baseline in small-sample, high-dimensional settings.
+
+### 2.3 Quadratic Discriminant Analysis (QDA)
+
+QDA relaxes the equal-covariance assumption of LDA, allowing class-specific covariance matrices $\Sigma_c$:
+
+$$\delta_c(x) = -\frac{1}{2} \log |\Sigma_c| - \frac{1}{2}(x - \mu_c)^\top \Sigma_c^{-1}(x - \mu_c) + \log \pi_c$$
+
+QDA produces quadratic decision boundaries and can capture heteroscedastic class structures, but requires sufficient within-class observations to estimate $\Sigma_c$ reliably. In high-dimensional settings with small samples, QDA is prone to rank deficiency and was therefore restricted to a maximum of two selected wavelengths.
+
+### 2.4 k-Nearest Neighbours (k-NN)
+
+Given a new observation $x$, the predicted class is determined by majority vote among the $k$ nearest training points $\mathcal{N}_k(x)$:
+
+$$\hat{y}(x) = \arg\max_{c} \sum_{i \in \mathcal{N}_k(x)} \mathbb{I}(y_i = c)$$
+
+k-NN is a non-parametric, instance-based classifier that makes no distributional assumptions. Its bias-variance trade-off is governed by $k$, which was tuned jointly with the number of retained wavelengths via inner cross-validation. The optimal kernel weighting function was also selected during tuning.
+
+### 2.5 Support Vector Machine (SVM)
+
+SVM estimates a separating hyperplane by solving the regularised optimisation problem:
+
+$$\min_{w,b,\xi} \; \frac{1}{2}\|w\|^2 + C\sum_{i=1}^n \xi_i \quad \text{subject to} \quad y_i(w^\top x_i + b) \geq 1 - \xi_i, \; \xi_i \geq 0$$
+
+where $C > 0$ controls the margin-error trade-off and was tuned via inner cross-validation. A linear kernel was used, appropriate for high-dimensional settings where $p \gg n$. Predictors were standardised prior to fitting to ensure comparable feature scales.
+
+### 2.6 Random Forest (RF)
+
+Random Forest builds an ensemble of $B$ decision trees, each trained on a bootstrap sample of the data with a random subset of $m$ predictors considered at each split:
+
+$$\hat{y}(x) = \arg\max_{c} \sum_{b=1}^B \mathbb{I}(\hat{y}_b(x) = c)$$
+
+RF is robust to overfitting through averaging, handles high-dimensional correlated predictors well, and provides variable importance measures via the mean decrease in node impurity. $B = 500$ trees were used in all experiments.
+
+### 2.7 XGBoost
+
+XGBoost fits an additive ensemble of $M$ regression trees by sequentially minimizing a regularized objective:
+
+$$\mathcal{L} = \sum_{i=1}^n \ell\!\left(y_i,\, \hat{y}_i^{(m-1)} + f_m(x_i)\right) + \Omega(f_m)$$
+
+where $\ell$ is the logistic loss for binary classification, $f_m$ is the $m$-th tree added at iteration $m$, and $\Omega(f_m)$ penalises tree complexity. The learning rate $\eta = 0.1$, maximum tree depth of 3, and subsampling-ratio of 0.8 were fixed across all experiments.
+
+### 2.8 Comparative Summary
+
+| Model | Decision boundary | Distributional assumptions | Notes |
+|:---|:---|:---|:---|
+| Naïve Bayes | — | Conditional independence | Robust with small $n$ |
+| LDA | Linear | Multivariate normal, equal $\Sigma$ | SVD-based for $p > n$ |
+| QDA | Quadratic | Multivariate normal, class-specific $\Sigma_c$ | Restricted to $\leq 2$ wavelengths |
+| k-NN | Non-parametric | None | $k$ and kernel tuned via CV |
+| SVM | Linear | None | $C$ tuned via CV, features scaled |
+| Random Forest | Non-parametric | None | 500 trees, impurity importance |
+| XGBoost | Non-parametric | None | $\eta = 0.1$, depth = 3 |
+
+## **Comparative Analysis and Model Performance**
+
+### 3.1 Classification Performance
+
+Table 6 reports the balanced accuracy, AUC, sensitivity, and specificity for all classifier-feature selection combinations on both datasets. The figure summarises the best configuration per classifier.
+
+For the best imputed dataset (IMP, n = 49, K ≤ 0.5), the balanced accuracy ranged from 0.338 (QDA_auc) to 0.560 (RF_anova), with most classifiers clustering near the chance level of 0.5. The best-performing configuration was Random Forest with ANOVA feature selection (BAcc = 0.560, AUC = 0.529, Sensitivity = 0.853, Specificity = 0.267). A consistent pattern emerged across all classifiers: sensitivity was substantially higher than specificity, indicating a systematic tendency to classify fillets as fresh regardless of their true label. This asymmetry reflects the class imbalance in the imputed dataset (pos/neg ratio ≈ 2:1) and the difficulty of identifying spoiled fillets from NIR spectra alone.
+Complete cases (REAL, n = 30, K ≤ 0.4) showed a generally higher performance, with balanced accuracy ranging from 0.373 (LDA_anova) to 0.667 (NB_mrmr). The best configuration was Naïve Bayes with mRMR feature selection (BAcc = 0.667, AUC = 0.718, Sensitivity = 0.545, Specificity = 0.789), showing a more balanced trade-off between sensitivity and specificity compared to IMP results. Notably, several classifiers using the AUC criterion (i.e. SVM (BAcc = 0.612, Sensitivity = 0.909) and LDA (BAcc = 0.608)) achieved high sensitivity at the cost of low specificity, mirroring the pattern observed on IMP.
+Across both datasets, the choice of feature selection criterion had a moderate effect on performance. On IMP, ANOVA and AUC criteria tended to outperform mRMR for most classifiers. On REAL, mRMR yielded the best overall result (NB_mrmr, BAcc = 0.667), while ANOVA criterion produced consistent performance across NB and kNN.
+
+```{r model run}
+models_all_fs <- list(
+  LDAClassifier$new(nfeat_max = 5L),
+  QDAClassifier$new(nfeat_max = 2L),
+  NBClassifier$new(nfeat_max  = 5L),
+  KNNClassifier$new(nfeat_max = 5L),
+  SVMClassifier$new(nfeat_max = 5L),
+  RFClassifier$new(nfeat_max  = 5L),
+  XGBClassifier$new(nfeat_max = 5L)
+)
+
+if (!file.exists("data/results/imputation results.rds")) {
+  out_IMP <- run_step1_complete(task_IMP,  ri_IMP,  "IMP")
+  out_REAL <- run_step1_complete(task_REAL, ri_REAL, "REAL")
+
+  saveRDS(out_IMP, "data/results/imputation results.rds")
+  saveRDS(out_REAL, "data/results/real results.rds")
+}
+
+out_IMP <- readRDS("data/results/imputation results.rds")
+out_REAL <- readRDS("data/results/real results.rds")
+
+results_step1 <- rbindlist(list(out_IMP$metrics, out_REAL$metrics))
+
+probs_step1 <- list(
+  IMP = out_IMP$probs,
+  REAL = out_REAL$probs
+)
+
+setorder(results_step1, dataset, -bacc)
+
+kableExtra::kable(results_step1[, .(dataset, learner, fs_method, acc, bacc, auc, sens, spec)], "html", caption = "Table 6: Model summaries") |>
+  kableExtra::kable_styling(full_width = FALSE, font_size = 10) |>
+  kableExtra::scroll_box(width = "100%", height = "400px")
+
+p3 <- ggplot_performance_summary(results_step1)
+p3
+```
+
+### 3.2 Sensitivity Analysis
+
+To assess the robustness of classification results to the imputation strategy, all classifiers were re-trained across all 10 imputed datasets using the best feature selection criterion identified on the best imputed dataset. Balanced accuracy was summarised as mean ± SD with 95% confidence intervals across the 10 imputations (Table 7).
+Results were consistent across imputed datasets, with mean balanced accuracy ranging from 0.503 ± 0.057 (XGBoost) to 0.566 ± 0.062 (SVM). All classifiers yielded mean balanced accuracy above 0.5, though confidence intervals overlapped with the chance level for most models - most notably XGBoost (95% CI: 0.467–0.538) and kNN (95% CI: 0.475–0.560). SVM and NB showed the highest and most stable performance, with 95% CI lower bounds of 0.527 and 0.508 respectively, both marginally above chance.
+A consistent pattern across all classifiers was high sensitivity (0.691–0.835) paired with low specificity (0.200–0.404), indicating a systematic tendency to classify fillets as fresh. This asymmetry likely reflects both the class imbalance in the imputed dataset and the weak discriminative signal of NIR spectra for spoilage detection under the K ≤ 0.5 threshold.
+The variability across imputed datasets was non-negligible (SD ranging from 0.057 to 0.091) confirming that imputation strategy influences classification results and supporting the need for the parallel complete-case analysis as a more conservative benchmark.
+
+```{r results}
+best_config_imp <- results_step1[
+  dataset == "IMP",
+  .SD[which.max(bacc)],
+  by = .(learner_base = gsub("_auc|_anova|_mrmr", "", learner))
+][, .(learner_base, fs_method, bacc)]
+
+best_config_real <- results_step1[
+  dataset == "REAL",
+  .SD[which.max(bacc)],
+  by = .(learner_base = gsub("_auc|_anova|_mrmr", "", learner))
+][, .(learner_base, fs_method, bacc)]
+
+if (!file.exists("data/results/sensitive analysis.rds")) {
+  results_step2 <- rbindlist(lapply(1:N_IMP, function(m_idx) {
+    cat(sprintf("\n── Dataset imputato #%d ──\n", m_idx))
+
+    kv_m <- get_kvalue(imp = imp, m_idx)
+    data_m <- make_dataset(data_spectra_full[, ..nir_vars_w], kv_m, KVALUE_THRESHOLD, sprintf("#%d", m_idx))
+    task_m <- make_task(data_m, sprintf("imp%d", m_idx))
+
+    set.seed(123)
+    ri_m <- rsmp("repeated_cv", folds = 5, repeats = 10)
+    ri_m$instantiate(task_m)
+
+    rbindlist(lapply(seq_len(nrow(best_config_imp)), function(r) {
+      bc <- best_config_imp[r]
+
+      mdl <- Filter(function(m) m$name == bc$learner_base, models_all_fs)
+
+      if (length(mdl) == 0) {
+        message(sprintf(" Classifier non trovato: %s", bc$learner_base))
+        return(NULL)
+      }
+
+      mdl <- mdl[[1]]$clone()
+
+      res <- tryCatch(
+        run_cv_fs(mdl, task_m, ri_m, fs_method = bc$fs_method),
+        error = function(e) {
+          message(sprintf(" %s error: %s", bc$learner_base, e$message))
+          NULL
+        })
+
+      if (is.null(res)) return(NULL)
+
+      res$metrics[, imp_dataset := m_idx]
+      res$metrics
+    }))
+  }))
+
+  saveRDS(results_step2, "data/results/sensitive analysis.rds")
+}
+
+results_step2 <- readRDS("data/results/sensitive analysis.rds")
+
+ci_summary <- results_step2[, {
+  rbindlist(lapply(c("acc","bacc","auc","sens","spec"), function(mt) {
+    vals <- get(mt)
+    m <- mean(vals, na.rm = TRUE)
+    s <- sd(vals, na.rm = TRUE)
+    se <- s / sqrt(.N)
+    data.table(
+      metric = mt,
+      mean = round(m, 3),
+      sd = round(s, 3),
+      ci_low = round(m - 1.96 * se, 3),
+      ci_up = round(m + 1.96 * se, 3)
+    )
+  }))
+}, by = learner]
+
+kableExtra::kable(ci_summary, "html", caption = "Table 7: Sensitive analysis (imputed data)") |>
+  kableExtra::kable_styling(full_width = FALSE, font_size = 10) |>
+  kableExtra::scroll_box(width = "100%", height = "400px")
+
+p4 <- ggplot_sensitivity_confint(ci_summary)
+p4
+```
+
+### 3.3 Feature Selection Stability
+
+The figure shows the top 5 most frequently selected wavelengths per classifier on both datasets. Two distinct patterns emerge.
+On the imputed dataset (IMP), feature selection converged strongly across all classifiers on the 1440–1490 nm region (O–H/N–H bonds), with W1459 and W1453–W1464 nm dominating regardless of the FS criterion used. Selection frequencies ranged from 11% (W1453, NB) to 35% (W1459, QDA), with consistent agreement across LDA, QDA, NB, kNN, RF, SVM and XGBoost. This cross-classifier convergence seems to suggests a genuine spectral signal in this region on the imputed dataset.
+Complete cases (REAL) show a different, more heterogeneous pattern in feature selection, revealing two distinct spectral clusters that depend on the classifier and FS criterion:
+
+- 1630–1700 nm (C=O stretching, lipid oxidation): dominant for SVM (W1653: 28%, W1660: 21%), LDA (W1653: 32%, W1660: 20%), QDA (W1653: 59%) and XGBoost (W1653: 46%). This region is associated with oxidation of unsaturated fatty acids, a known post-mortem process in fish muscle.
+
+- 2130–2310 nm (C–H/C–O bonds, fatty acid esters): consistently selected by kNN, NB and RF, with selection frequencies of 7–19%. This region reflects broader lipid and protein degradation products.
+
+The divergence between classifiers on REAL, with some favouring the lipid oxidation region and others the ester region, reflects genuine methodological uncertainty rather than noise, and indicates that the discriminative NIR signal for freshness in Sparus aurata is distributed across multiple spectral regions rather than concentrated at a single wavelength.
+
+```{r feature stability, fig.height = 10}
+if (!file.exists("data/results/feature stability imputated.rds")) {
+  bands_IMP <- extract_band_freq(task_IMP, ri_IMP, "IMP")
+  bands_REAL <- extract_band_freq(task_REAL, ri_REAL, "REAL")
+
+  saveRDS(bands_IMP, "data/results/feature stability imputated.rds")
+  saveRDS(bands_REAL, "data/results/feature stability real.rds")
+}
+
+bands_IMP <- readRDS("data/results/feature stability imputated.rds")
+bands_REAL <- readRDS("data/results/feature stability real.rds")
+
+bands_all <- rbindlist(list(bands_IMP, bands_REAL))
+
+p5 <- ggplot_band_frequency(bands_all)
+p5
+```
+
+### 3.4 Permutation Tests
+
+To assess whether classification performance exceeded chance, permutation tests (999 permutations) were conducted on the best-performing classifier per dataset.
+On the imputed dataset, RF_anova achieved a balanced accuracy of 0.560, compared to a mean permuted distribution of 0.487 (p = 0.188, see left panel). The observed performance does not significantly exceed the null distribution, indicating that the discriminative signal of NIR spectra on the imputed dataset cannot be distinguished from chance through the cross-validation scheme.
+On the complete-case dataset, NB_mrmr achieved a balanced accuracy of 0.667, compared to a mean permuted distribution of 0.495 (p = 0.040, see right panel). This result is statistically significant, indicating that NIR spectra carry genuine discriminative information for freshness classification on the complete-case data beyond what would be expected by chance.
+
+The contrast between the two datasets is informative: the absence of significance on IMP despite higher sample size (n = 49) compared to REAL (n = 30) suggests that the imputation process introduces variability that dilutes the discriminative NIR signal, rather than amplifying it. This reinforces the interpretation that results on complete-case data represent a more reliable, even though more conservative, estimate of the true discriminative capacity of NIR spectroscopy for Sparus aurata freshness classification.
+
+```{r permutation test}
+best_IMP <- results_step1[dataset == "IMP", .SD[which.max(bacc)]]
+best_REAL <- results_step1[dataset == "REAL", .SD[which.max(bacc)]]
+
+cfg_IMP <- get_model_config(best_IMP$learner)
+cfg_REAL <- get_model_config(best_REAL$learner)
+
+if (!file.exists("data/results/permutation imputated.rds")) {
+
+  best_bands_IMP <- bands_IMP[
+    learner == gsub("_auc|_anova|_mrmr", "", best_IMP$learner),
+    as.character(banda)
+  ]
+
+  best_bands_REAL <- bands_REAL[
+    learner == gsub("_auc|_anova|_mrmr", "", best_REAL$learner),
+    as.character(banda)
+  ]
+
+  perm_IMP <- run_permutation(classifier = cfg_IMP$mdl$clone(), best_hp = NULL,
+    best_bands = best_bands_IMP, best_threshold = best_IMP$threshold, task = task_IMP,
+    ri = ri_IMP, obs_bacc = best_IMP$bacc, label = best_IMP$learner
+  )
+
+  perm_REAL <- run_permutation(classifier = cfg_REAL$mdl$clone(), best_hp = NULL,
+    best_bands = best_bands_REAL, best_threshold = best_REAL$threshold, task = task_REAL,
+    ri = ri_REAL, obs_bacc = best_REAL$bacc, label = best_REAL$learner
+  )
+
+  saveRDS(perm_IMP, "data/results/permutation imputated.rds")
+  saveRDS(perm_REAL, "data/results/permutation real.rds")
+}
+
+perm_IMP <- readRDS("data/results/permutation imputated.rds")
+perm_REAL <- readRDS("data/results/permutation real.rds")
+
+kableExtra::kable(rbindlist(list(perm_IMP$summary, perm_REAL$summary)), "html", caption = "Table 8: Permutation analysis") |>
+  kableExtra::kable_styling(full_width = FALSE, font_size = 10) |>
+  kableExtra::scroll_box(width = "100%", height = "400px")
+
+p6 <- ggplot_permutation_test(list(perm_IMP, perm_REAL))
+p6
+```
+
+## **Linear Mixed Model Analysis**
+
+### 4.1 Partial Correlations
+
+To identify NIR wavelengths associated with K-value independently of the temporal deterioration trend, partial correlations between individual NIR bands and K-value were computed on complete-case data (n = 30), controlling for storage day (Table 9).
+No band reached statistical significance at p < 0.05. Three adjacent bands in the 1520–1532 nm region showed the strongest borderline associations (W1526: r = 0.364, p = 0.052; W1520: r = 0.333, p = 0.078; W1532: r = 0.328, p = 0.083), corresponding to protein N–H and C–H combination vibrations associated with post-mortem protein degradation. With 140 simultaneous tests, 14 false positives would be expected by chance at p < 0.10. Therfore, observing 15 bands but spatially concentrated in a narrow region around 1440–1540 nm is consistent with weak but genuine signal rather than random noise.
+Notably, the 1653 nm band, consistently selected by classification models on REAL, showed no significant partial correlation with K-value after controlling for storage day (r = 0.089, p = 0.641). This indicates that while this spectral region carries discriminative information for class separation, it does not predict the degree of biochemical deterioration independently of storage time.
+
+### 4.2 LMM Candidate Comparison
+
+Six NIR predictors were tested as fixed effects in a linear mixed model with storage day as a random intercept (Table 10). The mean absorbance of the 1520–1532 nm region was the only predictor reaching statistical significance (β = 0.216, p = 0.013, LRT p = 0.018, ΔR² = 0.056), consistent with the partial correlation analysis. Spectral regions identified by classification models (i.e. O–H/N–H (1440–1490 nm), C=O lipids (1630–1700 nm), C–H fatty acids (1750–1810 nm) and C–H/C–O esters (2130–2310 nm)) did not predict K-value independently of storage day (p > 0.25 for all).
+
+#### 4.3 Final Model
+
+The final LMM was fitted by REML with NIR_1520_1532 as fixed effect and storage day as random intercept:
+
+$$\text{Kvalue}_{ij} = (\beta_0 + u_j) + \beta_1 \cdot \text{NIR}_{1520\text{-}1532,ij} + \varepsilon_{ij}$$
+
+$$u_j \sim \mathcal{N}(0, \sigma^2_{\text{day}}), \quad \varepsilon_{ij} \sim \mathcal{N}(0, \sigma^2)$$
+
+```{r linear mixed model}
+lmm_data <- prepare_lmm_data(data_original)
+X_real <- lmm_data$X_real
+kv <- lmm_data$kv
+day <- lmm_data$day
+
+partial_cors <- run_partial_cors(X_real, kv, day)
+
+kableExtra::kable(partial_cors[1:15], "html", caption = "Table 9: Partial correlations") |>
+  kableExtra::kable_styling(full_width = FALSE, font_size = 10) |>
+  kableExtra::scroll_box(width = "100%", height = "400px")
+
+lmm_cands <- run_lmm_candidates(X_real, kv, day)
+results_lmm <- lmm_cands$results
+df_model <- lmm_cands$df_base
+mod0 <- lmm_cands$mod0
+
+kableExtra::kable(results_lmm, "html", caption = "Table 10: Model results") |>
+  kableExtra::kable_styling(full_width = FALSE, font_size = 10) |>
+  kableExtra::scroll_box(width = "100%", height = "400px")
+
+mod_intercept <- lmer(Kvalue ~ NIR_1520_1532 + (1|day), data = df_model)
+mod_slope <- lmer(Kvalue ~ NIR_1520_1532 + (NIR_1520_1532|day), data = df_model)
+
+r2_reg <- MuMIn::r.squaredGLMM(mod_intercept)
+r2_n <- MuMIn::r.squaredGLMM(mod0)
+
+p7 <- ggplot_lmm_results(df_model, mod_intercept, predictor = "NIR_1520_1532")
+p7
+```
+
+The NIR 1520-1532 nm region was significantly associated with K-value ($\beta$ = `r round(fixef(mod_intercept)["NIR_1520_1532"], 3)`,
+SE = `r round(coef(summary(mod_intercept))["NIR_1520_1532", "Std. Error"], 3)`, $t$ = `r round(coef(summary(mod_intercept))["NIR_1520_1532", "t value"], 3)`, df = `r round(coef(summary(mod_intercept))["NIR_1520_1532", "df"], 2)`, $p$ = `r round(coef(summary(mod_intercept))["NIR_1520_1532", "Pr(>|t|)"], 3)`), explaining an additional `r round((r2_reg[2] - r2_n[2]) * 100, 1)`% of K-value variance beyond the temporal trend ($\Delta R^2$ = `r round(r2_reg[2] - r2_n[2], 3)`). Between-day variability accounted for the large majority of total variance ($\sigma^2_{\text{day}}$ =
+`r round(as.data.frame(VarCorr(mod_intercept))$vcov[1], 4)`, $\sigma^2_{\text{residual}}$ = `r round(as.data.frame(VarCorr(mod_intercept))$vcov[2], 4)`, ICC = `r round(as.data.frame(VarCorr(mod_intercept))$vcov[1] / sum(as.data.frame(VarCorr(mod_intercept))$vcov), 2)`), confirming the dominant role of storage day in determining freshness.
+
+A random slope for NIR_1520_1532 was also tested but did not improve model fit (LRT: $\chi^2$ = `r round(anova(mod_intercept, mod_slope)[2, "Chisq"], 3)`, df = `r anova(mod_intercept, mod_slope)[2, "Df"]`, $p$ = `r round(anova(mod_intercept, mod_slope)[2, "Pr(>Chisq)"], 3)`), indicating that the association between NIR absorbance and K-value is consistent across storage days.
+
+### 4.4 Model Diagnostics
+
+Model assumptions were assessed via Pearson residual diagnostics. Residuals were approximately normally distributed (Shapiro-Wilk W = 0.990, p = 0.992; Lilliefors D = 0.067, p = 0.979) and showed no systematic patterns against fitted values or observation index. Mild autocorrelation was observed at lags 9 and 13, consistent with the limited temporal replication within storage days. Random effects showed a monotonic increasing pattern from day 1 to day 10, with wide confidence intervals for days 1 and 10 reflecting limited within-day replication.
+
+```{r linear mixed model diagnostics, fig.height = 10}
+p8 <- ggplot_lmm_diagnostics(mod_intercept, summaries = FALSE)
+p8
+```
+
+## **Overall study results**
+
+NIR spectroscopy showed weak but partially significant discriminative capacity for freshness classification in Sparus aurata. On complete-case data, Naïve Bayes with mRMR feature selection achieved a balanced accuracy of 0.667, significantly above chance (permutation test p = 0.040). On imputed data, no classifier exceeded chance (best: RF_anova, BAcc = 0.560, p = 0.188). Sensitivity analysis across 10 imputed datasets confirmed limited and unstable performance (mean BAcc: 0.503–0.566), with all classifiers showing high sensitivity but low specificity, indicating a systematic tendency to classify fillets as fresh regardless of true label.
+Feature selection converged on the 1440–1490 nm region (O–H/N–H bonds) on imputed data and on the 1630–1700 nm region (C=O lipids) on complete-case data, though the latter showed no significant association with K-value in the regression framework.
+The linear mixed model identified a significant positive association between mean NIR absorbance at 1520–1532 nm and K-value, independently of storage day (β = 0.218, p = 0.014, ΔR² = 0.056). However, this region explained only 2.8% of marginal variance, with storage day accounting for 93% of total K-value variability.
+Taken together, these results suggest that NIR spectroscopy captures a genuine but weak biochemical signal for freshness in Sparus aurata. Given the limited sample size, this constitutes a positive exploratory result, warranting further investigation with larger, more balanced datasets before any conclusions on the practical applicability of NIR spectroscopy for routine freshness assessment can be drawn.
